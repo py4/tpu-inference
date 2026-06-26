@@ -112,10 +112,25 @@ def load_dummy_weights_jax(model, mesh: Mesh) -> None:
             param._weights_to_load[:] = jnp.vsplit(
                 dummy, indices_or_sections=num_experts)
 
-        assign_and_shard_param(param, dummy, param_name)
+        # GLM-5.2: `dummy` is already created on-device with the target sharding
+        # (jax.jit(out_shardings=sharding) in create_dummy_weights_on_tpu). The
+        # device_put inside assign_and_shard_param takes JAX's slow host
+        # round-trip path and, with replicated params (model=1 mesh), broadcasts
+        # GBs/param through the host -> exceeds the Pathways client timeout.
+        # Assign the already-sharded array directly instead.
+        param.set_value(dummy)
+        param.set_metadata("_is_loaded", True)
 
     # Post-process (quantisation etc.) per-module.
     _process_weights_after_loading_jax(model)
+
+    # GLM-5.2: the real load_weights path calls model.initialize_cache() (builds
+    # RoPE sin/cos); the dummy loader bypasses the model's load_weights, so do it
+    # here or the forward hits "RoPE cache not initialized".
+    _ic = getattr(model, "initialize_cache", None) or getattr(
+        getattr(model, "model", None), "initialize_cache", None)
+    if callable(_ic):
+        _ic()
 
     logger.info(
         "Pathways dummy weight loading (jax) took %.2fs",

@@ -285,6 +285,8 @@ class JaxMoE(JaxModule):
         """
 
         cnt = 0
+        import time as _time
+        _t_loop = _time.perf_counter()
         for param_name, torch_weight in weights:
             cnt += 1
             param_name: str = param_name.split(
@@ -314,9 +316,22 @@ class JaxMoE(JaxModule):
                 torch_weight.shape)  # add expert dim for concatenation later
             jax_param._weights_to_load[expert_id] = jax_weight
 
-        logger.debug(f"Loaded {cnt} weights for {self.prefix} MoE layer.")
+        logger.info("[MoE-load] %s per-expert convert loop: %d weights in %.1fs",
+                    self.prefix, cnt, _time.perf_counter() - _t_loop)
 
         loaded_names = set()
+        # param.sharding (nnx.Param attribute) returns None here, so the original
+        # shard_put fell back to a replicated layout (full E per chip) -> 256-expert
+        # HBM OOM. Use the layer's intended shardings instead. down_proj follows
+        # edf_sharding for fused backends, efd_sharding otherwise (see __post_init__).
+        down_sharding = (self.edf_sharding
+                         if self.moe_backend in MoEBackend.fused_moe_backends()
+                         else self.efd_sharding)
+        param_shardings = {
+            "kernel_gating_EDF": self.edf_sharding,
+            "kernel_up_proj_EDF": self.edf_sharding,
+            "kernel_down_proj_EFD": down_sharding,
+        }
         # This function could be called more than once, if the weights for moe layer is spread
         # across multiple safetensor files. Here we use counter to track the completion of weight loading, and only perform the fusion and sharding after all weights are loaded.
         for param_name, param in {
@@ -326,14 +341,27 @@ class JaxMoE(JaxModule):
         }.items():
             weights_to_load = param._weights_to_load
             if all(w is not None for w in weights_to_load):
+                _t0 = _time.perf_counter()
                 with cpu_mesh_context():
                     weights = jnp.concatenate(param._weights_to_load, axis=0)
+                _t1 = _time.perf_counter()
+                # The original code passed param.sharding (which is None here) to
+                # shard_put -> P() -> replicated (full E per chip) -> 256-expert
+                # OOM. Pass the layer's INTENDED sharding so the CPU->TPU
+                # device_put shards the expert dim directly (no replicated
+                # intermediate, no slow post-hoc reshard).
+                spec_src = param_shardings[param_name]
                 try:
-                    param.value = shard_put(weights, param.sharding, mesh)
+                    param.value = shard_put(weights, spec_src, mesh)
                     loaded_names.add(param_name)
                 except Exception as e:
                     raise RuntimeError(
-                        f"Failed to load weights for {param_name} with {weights.shape=} {param.value.shape=}"
+                        f"Failed to load weights for {param_name} with {weights.shape=}"
                     ) from e
+                _t2 = _time.perf_counter()
+                logger.info(
+                    "[MoE-load] %s concat=%.1fs shard_put=%.1fs spec=%s -> %s",
+                    param_name, _t1 - _t0, _t2 - _t1, spec_src,
+                    param.value.sharding.spec)
 
         return loaded_names

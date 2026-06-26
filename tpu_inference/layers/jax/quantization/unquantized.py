@@ -231,6 +231,20 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
             w_up = layer.kernel_up_proj_EDF.get_value()
             w2_val = layer.kernel_down_proj_EFD.get_value()
 
+            mesh = jax.sharding.get_mesh()
+            # The loaded EDF/EFD params can arrive fully replicated (spec=P())
+            # rather than expert-sharded -- under proxy,cpu the loader's
+            # shard_put does not always apply the intended spec. If left
+            # replicated, the fused-weight processing below materializes the
+            # full E-expert tensor on every chip (~36G at 256 experts) -> HBM
+            # OOM. Re-shard to the intended expert layout so processing and the
+            # reorder stay per-shard.
+            edf_ns = NamedSharding(mesh, P(*layer.edf_sharding))
+            if w_gate.sharding != edf_ns:
+                w_gate = jax.device_put(w_gate, edf_ns)
+                w_up = jax.device_put(w_up, edf_ns)
+                w2_val = jax.device_put(w2_val, edf_ns)
+
             # Free old params before processing to reduce peak memory.
             del layer.kernel_gating_EDF
             del layer.kernel_up_proj_EDF
@@ -239,7 +253,6 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
             w13_val = jnp.concatenate([w_gate, w_up], axis=1)
             del w_gate, w_up
 
-            mesh = jax.sharding.get_mesh()
             weights = process_unquantized_moe_weights(
                 mesh=mesh,
                 moe_backend=layer.moe_backend,
