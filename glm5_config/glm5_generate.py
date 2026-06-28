@@ -22,6 +22,13 @@ kw = dict(model=MODEL, dtype="bfloat16", max_model_len=128, max_num_seqs=1,
           max_num_batched_tokens=256,
           gpu_memory_utilization=float(os.environ.get("GEN_GPU_UTIL", "0.92")),
           tensor_parallel_size=TP, trust_remote_code=True)
+# When attention heads are sharded on the 'expert' axis (GLM_ATTN_EXPERT_SHARD>1),
+# the KV cache shards only attn_dp_expert-way, and vllm's auto block-sizing (which
+# assumes wide sharding) massively over-allocates -> 146G OOM. Cap the KV block
+# count for short-prompt generation. GEN_KV_BLOCKS pages is plenty for max_len=128.
+_kvb = int(os.environ.get("GEN_KV_BLOCKS", "0"))
+if _kvb > 0:
+    kw["num_gpu_blocks_override"] = _kvb
 # MLA + GMM_EP sharding (same as parity runs).
 ss = {"enable_dp_attention": True}
 ep = int(os.environ.get("SMOKE_EP", "1"))

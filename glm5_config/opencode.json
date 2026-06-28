@@ -1,0 +1,22 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "tpu": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "GLM-5.2 TPU",
+      "options": { "baseURL": "http://localhost:8000/v1", "apiKey": "dummy" },
+      "models": { "glm-5.2": { "name": "GLM-5.2 TPU", "limit": { "context": 2048, "output": 400 } } }
+    }
+  },
+  "model": "tpu/glm-5.2",
+  "small_model": "tpu/glm-5.2",
+  "agent": {
+    "tiny": {
+      "description": "Minimal coding agent",
+      "mode": "primary",
+      "model": "tpu/glm-5.2",
+      "prompt": "You are a terminal coding assistant. Use the bash tool to do the task. Be concise.",
+      "tools": { "bash": true, "skill": false, "write": false, "edit": false, "read": false, "glob": false, "grep": false, "list": false, "patch": false, "todowrite": false, "todoread": false, "task": false, "webfetch": false }
+    }
+  }
+}

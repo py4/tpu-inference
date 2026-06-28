@@ -271,6 +271,19 @@ class ShardingConfigManager:
             attn_dp = 1
             attn_dp_expert = 1
 
+        # GLM-5.2 BF16 on v6e-128: attention weights shard on ATTN_HEAD =
+        # (model, expert, dcp). With all expert parallelism on attn_dp_expert
+        # (expert=1), attention is REPLICATED (~25G/chip) -> BF16 OOM. The
+        # 'expert' axis is shared by ATTN_HEAD and ATTN_DATA_EXPERT, so moving
+        # part of the sharding onto 'expert' shards the attention heads there
+        # while experts stay sharded attn_dp_expert*expert-way (unchanged total).
+        # GLM_ATTN_EXPERT_SHARD = ways to shard the 64 attention heads.
+        import os as _os
+        _attn_shard = int(_os.environ.get("GLM_ATTN_EXPERT_SHARD", "1"))
+        if _attn_shard > 1 and attn_dp_expert % _attn_shard == 0:
+            attn_dp_expert = attn_dp_expert // _attn_shard
+            expert_parallelism = expert_parallelism * _attn_shard
+
         sharding_strategy = ShardingStrategy(
             tensor_parallelism=tensor_parallelism,
             data_parallelism=data_parallelism,

@@ -383,9 +383,12 @@ def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
         logger.warning(
             f"No tuned parameters found for the given tuning key: {tuning_key}, using default parameters"
         )
+        # GLM-5.2 (64 q-heads, v_head 256) has no tuned entry; the stock default
+        # (decode_batch_size=4, kv_pages=3) overflows SparseCore VMEM. Shrink to
+        # decode_batch_size=1 (we serve max_num_seqs=1 anyway) + kv_pages=1.
         return TunableParams(
-            decode_batch_size=4,
-            num_kv_pages_per_block=3,
+            decode_batch_size=1,
+            num_kv_pages_per_block=1,
             num_queries_per_block=1,
             vmem_limit_bytes=62914560,
         )
