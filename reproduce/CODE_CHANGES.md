@@ -66,9 +66,21 @@ while keeping experts 128-way. **This is the trick that makes pure BF16 fit v6e-
 Default fallback → `decode_batch_size=1, num_kv_pages_per_block=1` (stock 4/3 →
 `CompileTimeScopedVmemOom` for 64-head MLA). We serve `max_num_seqs=1` anyway.
 
-### `models/jax/utils/weight_utils.py` — o_proj 2D fix
+### `models/jax/utils/weight_utils.py` — o_proj 2D fix + on-device dummy loader
 MLA `o_proj.weight` is 2D `(N*v_head_dim, D)`; the generic branch assumed 3D
 per-head and crashed. Made ndim-aware.
+
+Also rewrote `JaxDummyModelLoader.load_weights` to generate random weights
+**on-device and sharded** (was host-CPU generation, which holds ~1 TB on the host
+for a 744B-param MoE → Ray node OOM). Paired with the `glm5.py` guard below, this
+enables a `--load-format dummy` serve that skips the ~61 min disk read (weight load
+~42 s) for fast dev iteration. Full how-to + the chain of fixes in
+**`RANDOM_WEIGHTS.md`**.
+
+### `models/jax/glm5.py` — dummy-MoE guard is opt-out
+`DeepSeekV3.__init__` used to unconditionally `raise` for `--load-format dummy` on
+the fused-MoE backends. The dummy loader supports MoE now, so the guard is gated by
+`GLM_ALLOW_DUMMY_MOE=1` (default still raises). See `RANDOM_WEIGHTS.md`.
 
 ### `models/common/pathways_dummy_loader.py` — dummy-load fix
 (Only relevant to dummy-weight smokes / the old Pathways path.) Assigns the

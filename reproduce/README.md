@@ -26,6 +26,10 @@ It was built and validated on our pod; this kit is everything needed to do it on
 - **Optional, experimental:** 1M-context serve (one-line RoPE + config bump) and a
   DSA "lightning indexer" path (numerically correct; decode-efficient up to ~4.3×
   at 128K; NOT in the default serve). See `GOTCHAS.md` and `CODE_CHANGES.md`.
+- **Fast dev iteration with random weights:** `LOADFMT=dummy ALLOWDUMMYMOE=1`
+  generates weights on-device and skips the ~61 min disk read (weight load ~42 s).
+  Output is gibberish — for "does the pipeline run / shapes / OOM / scheduling"
+  checks only, not correctness. See `RANDOM_WEIGHTS.md`.
 
 > Honesty note: the proven, default configuration is **8192-context pure BF16
 > without DSA / without spec-decoding**. The 1M and DSA paths are extensions with
@@ -59,6 +63,7 @@ reproduce/
 ├── RUNBOOK.md           <- exact step-by-step commands, start to finish
 ├── GOTCHAS.md           <- the hard-won traps; READ before debugging
 ├── CODE_CHANGES.md      <- the code: which branch, which 8 files, why
+├── RANDOM_WEIGHTS.md    <- fast dev: random on-device weights, skip the ~60min disk read
 ├── BUILD_LOG.md         <- raw append-only build log (deep reference, unfiltered;
 │                           includes our internal IPs/projects + dead-ends)
 ├── config/

@@ -1096,58 +1096,164 @@ class JaxDummyModelLoader(DummyModelLoader):
         weight_loading_start_counter = time.perf_counter()
         mesh = jax.sharding.get_mesh()
 
-        def _load_dummy_weight_on_thread(param_name, param: nnx.Param):
-            with cpu_mesh_context():
-                is_moe = hasattr(param, "_weights_to_load")
-                param_shape = param.get_value().shape
+        # Cache jitted generators by (shape, dtype, sharding, is_int) so params
+        # that share a shape/layout (e.g. every layer's attention or expert
+        # kernels) reuse one compiled program instead of recompiling per param.
+        _gen_cache: dict = {}
 
-                if is_moe:
-                    # For MoE parameters, the normal loading flow reads PyTorch
-                    # weights which are transposed (out_features, in_features)
-                    # compared to JAX. The downstream post-loading fusion methods
-                    # expect this transposed shape (E, F, D) instead of (E, D, F).
-                    # E = number of experts, D = input dimension, F = feed forward dimension
-                    num_experts, input_dim, intermediate_dim = param_shape
-                    param_shape = (num_experts, intermediate_dim, input_dim)
-
-                if jnp.issubdtype(param.get_value().dtype, jnp.integer):
-                    dummy_weight = jax.random.randint(
-                        key=jax.random.PRNGKey(0),
-                        shape=param_shape,
-                        minval=0,
-                        maxval=100,
-                        dtype=param.get_value().dtype,
-                    )
+        def _get_generator(shape, dtype, out_sharding, is_int):
+            ck = (shape, dtype, out_sharding, is_int)
+            fn = _gen_cache.get(ck)
+            if fn is None:
+                if is_int:
+                    raw = lambda k: jax.random.randint(k, shape, 0, 100, dtype)
                 else:
-                    dummy_weight = jax.random.uniform(
-                        key=jax.random.PRNGKey(0),
-                        shape=param_shape,
-                        dtype=param.get_value().dtype,
-                        # upstream claims this range works well
-                        # https://github.com/vllm-project/vllm/blob/7291d1b288558d48508e1a17c37b0aa170332264/vllm/model_executor/model_loader/weight_utils.py#L1088
-                        minval=-1e-3,
-                        maxval=1e-3,
-                    )
+                    raw = lambda k: jax.random.uniform(
+                        k, shape, dtype, minval=-1e-3, maxval=1e-3)
+                fn = jax.jit(raw, out_shardings=out_sharding)
+                _gen_cache[ck] = fn
+            return fn
 
-                if is_moe:
-                    param._weights_to_load[:] = jnp.vsplit(
-                        dummy_weight, indices_or_sections=num_experts)
+        def _dummy_out_sharding(param: nnx.Param) -> NamedSharding:
+            # Build the on-device output sharding from the param's own metadata so
+            # the random array is generated ALREADY sharded -- each chip
+            # materializes only its shard.
+            spec = param.get_metadata().get("sharding", ())
+            param_mesh = param.get_metadata().get("mesh") or mesh
+            if isinstance(spec, NamedSharding):
+                return spec
+            if isinstance(spec, SingleDeviceSharding) or spec == ():
+                return NamedSharding(param_mesh, P())
+            return NamedSharding(param_mesh, P(*spec))
 
-            # We must explicitly pass the `mesh` captured from the main thread
-            # into the worker threads. JAX mesh contexts are thread-local, so
-            # worker threads do not inherit the active TPU mesh.
-            assign_and_shard_param(param, dummy_weight, param_name, mesh=mesh)
+        def _load_dummy_weight_on_thread(param_name, param: nnx.Param,
+                                         spec_override=None):
+            is_moe = hasattr(param, "_weights_to_load")
+            param_shape = param.get_value().shape
+            dtype = param.get_value().dtype
 
-        with ThreadPoolExecutor(max_workers=64) as executor:
-            futures = [
-                executor.submit(_load_dummy_weight_on_thread, param_name,
-                                param)
-                for param_name, param in model.named_parameters()
-            ]
-            for future in futures:
-                future.result()
+            if is_moe:
+                # For MoE parameters, the normal loading flow reads PyTorch
+                # weights which are transposed (out_features, in_features)
+                # compared to JAX. The downstream post-loading fusion methods
+                # expect this transposed shape (E, F, D) instead of (E, D, F).
+                # E = number of experts, D = input dimension, F = feed forward dimension
+                num_experts, input_dim, intermediate_dim = param_shape
+                param_shape = (num_experts, intermediate_dim, input_dim)
 
-        self._process_weights_after_loading(model)
+            # Generate the random weight DIRECTLY ON-DEVICE, already sharded to the
+            # param's intended layout. The previous implementation generated each
+            # full param on the host CPU (cpu_mesh_context) and then transferred +
+            # sharded to TPU; for a 744B-param MoE that holds ~1TB of weights in
+            # host RAM (the per-expert `_weights_to_load` slices are retained until
+            # fusion), which OOM-kills the Ray node. Generating per-shard on-device
+            # via jit(out_shardings=...) avoids both the host-RAM blowup and the
+            # host->device copy, so a random-weight launch skips the ~50min disk
+            # read with no transfer cost. (RNG is positional, so each chip's shard
+            # is the correct slice of one globally-consistent random array.)
+            # MoE kernel params return () from get_metadata("sharding") (the
+            # nnx.Param sharding attr is None for them), so the generic path would
+            # generate them REPLICATED (full 6.4G/chip per param) -> HBM OOM. When
+            # the caller knows the layer's intended sharding (edf/efd), it passes
+            # spec_override so each chip materializes only its expert shard.
+            if spec_override is not None:
+                param_mesh = param.get_metadata().get("mesh") or mesh
+                out_sharding = NamedSharding(param_mesh, P(*spec_override))
+            else:
+                out_sharding = _dummy_out_sharding(param)
+            key = jax.random.PRNGKey(abs(hash(param_name)) % (2**31))
+            is_int = bool(jnp.issubdtype(dtype, jnp.integer))
+            dummy_weight = _get_generator(param_shape, dtype, out_sharding,
+                                          is_int)(key)
+
+            if is_moe:
+                # The GMM fusion only checks these are non-None (it reads the param
+                # VALUE, not the contents), so use lightweight markers instead of
+                # on-device per-expert slices -- slices are full on-device copies
+                # that double per-param HBM and pin the raw array.
+                param._weights_to_load[:] = [True] * num_experts
+
+            if spec_override is not None:
+                # Already correctly sharded on-device; set directly.
+                # assign_and_shard_param would shard_put with the param's own ()
+                # metadata spec and re-replicate it -> OOM.
+                param.set_value(dummy_weight)
+                param.set_metadata("_is_loaded", True)
+            else:
+                assign_and_shard_param(param,
+                                       dummy_weight,
+                                       param_name,
+                                       mesh=mesh)
+
+        # Interleave generation with per-module fusion. Generating ALL raw params
+        # up-front and fusing at the end would hold every layer's raw expert
+        # weights at once: the raw `edf` layout shards experts only
+        # attn_dp_expert-ways, so e.g. 256 experts of (E,F,D)=(256,2048,6144) are
+        # ~6.4G each and ~181G/chip across 75 MoE layers -> HBM OOM. Fusing each
+        # module right after its params are generated frees the raw kernels before
+        # the next layer (mirrors the real per-layer load), bounding peak HBM.
+        #
+        # NOTE: on-device sharded generation issues a multi-host SPMD dispatch per
+        # param; these MUST launch in the same order on every worker, so the walk
+        # is strictly sequential (a ThreadPoolExecutor races the dispatch order
+        # across hosts and aborts libtpu: "Terminating the libtpu controller").
+        def _gen_and_fuse(module, prefix: str = ""):
+            qm = getattr(module, 'quant_method', None)
+            if qm is not None:
+                # Generate all params under this (quant) module, then fuse + free
+                # raw, mirroring _process_weights_after_loading's stop-at-quant.
+                # MoE kernel params have no usable sharding metadata, so pass the
+                # layer's intended expert sharding explicitly (else they'd
+                # generate replicated and OOM HBM).
+                moe_specs = {}
+                if hasattr(module, 'edf_sharding'):
+                    # Generate the raw expert kernels sharded over the FULL mesh
+                    # (expert dim = axis 0 for all three, post-transpose), i.e. the
+                    # final ~128-way expert layout, NOT the raw edf layout which
+                    # shards experts only attn_dp_expert-ways (~8). At 8-way each
+                    # raw param is ~1.6G/chip and they accumulate faster than the
+                    # per-layer fusion frees them -> HBM OOM; at full-mesh sharding
+                    # each is ~50M/chip so all raw layers coexist comfortably and
+                    # the fusion reshards per-layer to its intended edf intermediate.
+                    full_mesh_spec = P(tuple(mesh.axis_names), None, None)
+                    moe_specs = {
+                        "kernel_gating_EDF": full_mesh_spec,
+                        "kernel_up_proj_EDF": full_mesh_spec,
+                        "kernel_down_proj_EFD": full_mesh_spec,
+                    }
+                for name, p in module.named_parameters(prefix=prefix,
+                                                       recurse=True):
+                    leaf = name.split(".")[-1]
+                    _load_dummy_weight_on_thread(
+                        name, p, spec_override=moe_specs.get(leaf))
+                qm.process_weights_after_loading(module)
+                return
+            for name, p in module.named_parameters(prefix=prefix,
+                                                    recurse=False):
+                _load_dummy_weight_on_thread(name, p)
+            if isinstance(module, JaxModuleList):
+                for idx, sub in enumerate(module):
+                    _gen_and_fuse(sub, f"{prefix}.{idx}" if prefix else str(idx))
+            else:
+                for name, child in module.named_children():
+                    _gen_and_fuse(child,
+                                  f"{prefix}.{name}" if prefix else name)
+
+        with jax.set_mesh(mesh):
+            _gen_and_fuse(model)
+            # The real model.load_weights initializes derived caches (e.g. the
+            # RoPE sin/cos cache) at the end; the dummy loader bypasses that path,
+            # so do it here or warmup asserts "RoPE cache not initialized". The
+            # method lives on an inner module (the top-level wrapper delegates), so
+            # recurse to find every initialize_cache (idempotent).
+            def _init_caches(mod):
+                fn = getattr(mod, "initialize_cache", None)
+                if callable(fn):
+                    fn()
+                for _, child in mod.named_children():
+                    _init_caches(child)
+
+            _init_caches(model)
         logger.info_once(
             f"Loading dummy weights took {time.perf_counter() - weight_loading_start_counter:.2f} seconds."
         )

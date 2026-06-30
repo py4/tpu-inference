@@ -1214,11 +1214,21 @@ class DeepSeekV3(JaxModule):
         self.moe_backend = select_moe_backend(self.use_ep)
 
         # TODO (jacobplatin): we will resolve this issue in a forthcoming PR that will refactor weight loading
+        # NOTE: the JaxDummyModelLoader (weight_utils.py) DOES handle MoE params now
+        # (it splits transposed random weights into `_weights_to_load` and runs the
+        # fusion via process_weights_after_loading), so this guard is overly broad.
+        # Allow opting in with GLM_ALLOW_DUMMY_MOE=1 to launch with random weights and
+        # skip the ~50min disk read for fast iteration.
         if vllm_config.load_config.load_format == "dummy" and self.moe_backend in MoEBackend.fused_moe_backends(
         ):
-            raise ValueError(
-                f"Random / dummy weights are not supported for {MoEBackend.fused_moe_backends()} backends right now."
-            )
+            if os.environ.get("GLM_ALLOW_DUMMY_MOE", "0") != "1":
+                raise ValueError(
+                    f"Random / dummy weights are not supported for {MoEBackend.fused_moe_backends()} backends right now. "
+                    f"Set GLM_ALLOW_DUMMY_MOE=1 to bypass (experimental)."
+                )
+            logger.warning(
+                "GLM_ALLOW_DUMMY_MOE=1: bypassing dummy-MoE guard; using random "
+                "weights for %s (skips disk read).", self.moe_backend)
 
         self.is_first_rank = get_pp_group().is_first_rank
         self.is_last_rank = get_pp_group().is_last_rank
